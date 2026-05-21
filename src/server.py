@@ -9,6 +9,16 @@ from src.protocol import (
     ok_response, err_response, null_response, data_response, message_response
 )
 from src.models import Consumer
+from src.topic_manager import (
+    TopicManager, TopicExistsError, TopicNotFoundError,
+    TopicHasSubscribersError, MaxTopicsReachedError, InvalidTopicNameError,
+)
+from src.queue_manager import (
+    QueueManager, QueueExistsError, QueueNotFoundError as QueueNotFoundErr,
+    QueueNotEmptyError, QueueFullError, InvalidQueueNameError,
+    EmptyMessageError, MessageTooLargeError,
+)
+from src.message_router import MessageRouter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +37,11 @@ class MQServer:
         self._server_socket: socket.socket | None = None
         self._running = False
         self._client_threads: list[threading.Thread] = []
+
+        # 核心模块
+        self.topic_mgr = TopicManager()
+        self.queue_mgr = QueueManager()
+        self.router = MessageRouter(self.topic_mgr, self.queue_mgr)
 
         # 消费者注册表: consumer_id -> Consumer
         self._consumers: dict[str, Consumer] = {}
@@ -141,6 +156,8 @@ class MQServer:
 
     def _unregister_consumer(self, consumer: Consumer) -> None:
         """注销消费者"""
+        # 从所有 Topic 中移除
+        self.topic_mgr.remove_consumer_from_all(consumer.consumer_id)
         with self._consumers_lock:
             self._consumers.pop(consumer.consumer_id, None)
         logger.info(f"Consumer {consumer.consumer_id} unregistered")
@@ -178,47 +195,133 @@ class MQServer:
     def _cmd_quit(self, cmd: Command, consumer: Consumer) -> str:
         return ok_response("BYE")
 
-    # --- Topic / Queue 管理（stub） ---
+    # --- Topic 管理 ---
     def _cmd_create_topic(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 2")
+        try:
+            name = cmd.args[0]
+            self.topic_mgr.create_topic(name)
+            return ok_response(f"Topic '{name}' created")
+        except InvalidTopicNameError as e:
+            return err_response("ERR_INVALID_NAME", str(e))
+        except TopicExistsError:
+            return err_response("ERR_TOPIC_EXISTS", f"Topic '{cmd.args[0]}' already exists")
+        except MaxTopicsReachedError:
+            return err_response("ERR_MAX_TOPICS_REACHED")
 
     def _cmd_delete_topic(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 2")
+        try:
+            name = cmd.args[0]
+            self.topic_mgr.delete_topic(name)
+            return ok_response(f"Topic '{name}' deleted")
+        except TopicNotFoundError:
+            return err_response("ERR_TOPIC_NOT_FOUND")
+        except TopicHasSubscribersError:
+            return err_response("ERR_TOPIC_HAS_SUBSCRIBERS")
 
     def _cmd_list_topics(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 2")
+        topics = self.topic_mgr.list_topics()
+        return data_response("\n".join(topics) if topics else "(empty)")
 
+    # --- Queue 管理 ---
     def _cmd_create_queue(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 2")
+        try:
+            name = cmd.args[0]
+            max_size = int(cmd.args[1]) if len(cmd.args) > 1 else None
+            self.queue_mgr.create_queue(name, max_size)
+            return ok_response(f"Queue '{name}' created")
+        except InvalidQueueNameError as e:
+            return err_response("ERR_INVALID_NAME", str(e))
+        except QueueExistsError:
+            return err_response("ERR_QUEUE_EXISTS")
 
     def _cmd_delete_queue(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 2")
+        try:
+            name = cmd.args[0]
+            self.queue_mgr.delete_queue(name)
+            return ok_response(f"Queue '{name}' deleted")
+        except QueueNotFoundErr:
+            return err_response("ERR_QUEUE_NOT_FOUND")
+        except QueueNotEmptyError:
+            return err_response("ERR_QUEUE_NOT_EMPTY")
 
     def _cmd_list_queues(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 2")
+        queues = self.queue_mgr.list_queues()
+        return data_response("\n".join(queues) if queues else "(empty)")
 
     # --- 消息生产 ---
     def _cmd_publish(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 2")
+        try:
+            topic, body = cmd.args[0], cmd.args[1]
+            msg_id = self.router.route_to_topic(topic, body)
+            return ok_response(msg_id)
+        except TopicNotFoundError:
+            return err_response("ERR_TOPIC_NOT_FOUND")
+        except EmptyMessageError:
+            return err_response("ERR_EMPTY_MESSAGE")
+        except MessageTooLargeError:
+            return err_response("ERR_MESSAGE_TOO_LARGE")
 
     def _cmd_send(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 2")
+        try:
+            queue, body = cmd.args[0], cmd.args[1]
+            msg_id = self.router.route_to_queue(queue, body)
+            return ok_response(msg_id)
+        except QueueNotFoundErr:
+            return err_response("ERR_QUEUE_NOT_FOUND")
+        except QueueFullError:
+            return err_response("ERR_QUEUE_FULL")
+        except EmptyMessageError:
+            return err_response("ERR_EMPTY_MESSAGE")
+        except MessageTooLargeError:
+            return err_response("ERR_MESSAGE_TOO_LARGE")
 
     # --- 消息消费 ---
     def _cmd_consume(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 2")
+        queue = cmd.args[0]
+        timeout = 0
+
+        # 解析 TIMEOUT <ms>
+        if len(cmd.args) >= 3 and cmd.args[1].upper() == "TIMEOUT":
+            try:
+                timeout = int(cmd.args[2]) / 1000.0  # ms → s
+            except ValueError:
+                return err_response("ERR_INVALID_TIMEOUT", "Timeout must be an integer in milliseconds")
+
+        try:
+            msg = self.router.consume_from_queue(
+                queue, consumer.consumer_id, timeout
+            )
+            if msg is None:
+                return null_response()
+            return message_response(msg.msg_id, msg.body)
+        except QueueNotFoundErr:
+            return err_response("ERR_QUEUE_NOT_FOUND")
 
     def _cmd_subscribe(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 2")
+        try:
+            topic = cmd.args[0]
+            self.topic_mgr.subscribe(topic, consumer.consumer_id)
+            consumer.subscriptions.add(topic)
+            return ok_response(f"Subscribed to '{topic}'")
+        except TopicNotFoundError:
+            return err_response("ERR_TOPIC_NOT_FOUND")
 
     def _cmd_unsubscribe(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 2")
-
-    def _cmd_consume_group(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 4")
+        try:
+            topic = cmd.args[0]
+            self.topic_mgr.unsubscribe(topic, consumer.consumer_id)
+            consumer.subscriptions.discard(topic)
+            return ok_response(f"Unsubscribed from '{topic}'")
+        except TopicNotFoundError:
+            return err_response("ERR_TOPIC_NOT_FOUND")
 
     def _cmd_set_offset(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 2")
+        try:
+            topic, offset = cmd.args[0], int(cmd.args[1])
+            self.router.set_offset(topic, consumer.consumer_id, offset)
+            return ok_response(f"Offset set to {offset}")
+        except ValueError as e:
+            return err_response("ERR_INVALID_OFFSET", str(e))
 
     # --- 消息确认 ---
     def _cmd_ack(self, cmd: Command, consumer: Consumer) -> str:
