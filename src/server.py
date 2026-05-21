@@ -19,6 +19,7 @@ from src.queue_manager import (
     EmptyMessageError, MessageTooLargeError,
 )
 from src.message_router import MessageRouter
+from src.persistence import PersistenceLayer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +43,7 @@ class MQServer:
         self.topic_mgr = TopicManager()
         self.queue_mgr = QueueManager()
         self.router = MessageRouter(self.topic_mgr, self.queue_mgr)
+        self.persistence = PersistenceLayer(data_dir="data")
 
         # 消费者注册表: consumer_id -> Consumer
         self._consumers: dict[str, Consumer] = {}
@@ -58,8 +60,15 @@ class MQServer:
         self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_socket.bind((self.host, self.port))
         self._server_socket.listen(128)
-        self._server_socket.settimeout(1.0)  # 每秒检查一次是否要退出
+        self._server_socket.settimeout(1.0)
         self._running = True
+
+        # 恢复持久化的消息
+        recovered = self.persistence.recover()
+        if recovered:
+            logger.info(f"Recovered {len(recovered)} messages from disk")
+            for msg in recovered:
+                self.router.restore_message(msg)
 
         logger.info(f"MQ Server listening on {self.host}:{self.port}")
 
@@ -96,6 +105,9 @@ class MQServer:
         # 等待所有客户端线程退出（最多 5 秒）
         for t in self._client_threads:
             t.join(timeout=5.0)
+
+        # 关闭持久化层
+        self.persistence.close()
 
         logger.info("Server stopped.")
 
@@ -253,6 +265,10 @@ class MQServer:
         try:
             topic, body = cmd.args[0], cmd.args[1]
             msg_id = self.router.route_to_topic(topic, body)
+            # 持久化消息
+            msg = self.router.get_message(msg_id)
+            if msg:
+                self.persistence.append(msg)
             return ok_response(msg_id)
         except TopicNotFoundError:
             return err_response("ERR_TOPIC_NOT_FOUND")
@@ -265,6 +281,10 @@ class MQServer:
         try:
             queue, body = cmd.args[0], cmd.args[1]
             msg_id = self.router.route_to_queue(queue, body)
+            # 持久化消息
+            msg = self.router.get_message(msg_id)
+            if msg:
+                self.persistence.append(msg)
             return ok_response(msg_id)
         except QueueNotFoundErr:
             return err_response("ERR_QUEUE_NOT_FOUND")

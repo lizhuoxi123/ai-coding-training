@@ -216,6 +216,15 @@ class MessageRouter:
         with self._msg_lock:
             return self._messages.get(msg_id)
 
+    def restore_message(self, msg: Message) -> None:
+        """从持久化恢复消息到内存（启动时调用）"""
+        with self._msg_lock:
+            if msg.msg_id not in self._messages:
+                self._messages[msg.msg_id] = msg
+                # 恢复的消息标记为 PENDING（如果未确认）
+                if msg.status != MessageStatus.ACKED:
+                    msg.status = MessageStatus.PENDING
+
     def get_pending_messages(self) -> list[Message]:
         """获取所有待投递的消息"""
         with self._msg_lock:
