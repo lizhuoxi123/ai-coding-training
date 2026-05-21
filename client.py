@@ -16,7 +16,11 @@
 
 import socket
 import sys
-import readline  # 启用行编辑和历史（Unix）；Windows 用 pyreadline
+
+try:
+    import readline  # Unix/macOS 行编辑
+except ImportError:
+    pass  # Windows 无 readline，不影响功能
 
 
 class MQClient:
