@@ -1,6 +1,6 @@
 """数据模型定义 —— Message, Consumer, MessageStatus"""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 import time
 import threading
@@ -33,22 +33,29 @@ class Message:
     original_target: str = ""  # 移入 DLQ 前的原始 target
 
     # ---- 类级别 ID 生成器 ----
-    _id_counter: int = field(default=0, repr=False, compare=False)
-    _id_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    _id_counter: int = 0
+    _id_lock: threading.Lock = threading.Lock()
 
     @classmethod
     def generate_id(cls) -> str:
         """生成全局唯一消息 ID: M{timestamp}{seq}"""
         with cls._id_lock:
             cls._id_counter += 1
+            counter = cls._id_counter
         ts = int(time.time() * 1000)
-        return f"M{ts}{cls._id_counter:06d}"
+        return f"M{ts}{counter:06d}"
 
 
 @dataclass
 class Consumer:
     """消费者会话"""
     consumer_id: str           # 格式 "C{conn_id}"
-    subscriptions: set = field(default_factory=set)    # 已订阅的 Topic 集合
-    groups: set = field(default_factory=set)            # 所属消费者组集合
+    subscriptions: set = None  # 已订阅的 Topic 集合
+    groups: set = None         # 所属消费者组集合
     last_heartbeat: float = 0.0
+
+    def __post_init__(self):
+        if self.subscriptions is None:
+            self.subscriptions = set()
+        if self.groups is None:
+            self.groups = set()

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+data/*.log
+data/*.idx
+data/index.json
