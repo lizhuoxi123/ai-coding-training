@@ -20,6 +20,10 @@ from src.queue_manager import (
 )
 from src.message_router import MessageRouter
 from src.persistence import PersistenceLayer
+from src.consumer_group import (
+    ConsumerGroupManager, GroupExistsError, GroupNotFoundError, GroupHasConsumersError,
+)
+from src.ack_manager import AckManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,6 +48,11 @@ class MQServer:
         self.queue_mgr = QueueManager()
         self.router = MessageRouter(self.topic_mgr, self.queue_mgr)
         self.persistence = PersistenceLayer(data_dir="data")
+        self.group_mgr = ConsumerGroupManager()
+        self.ack_mgr = AckManager()
+
+        # 后台线程
+        self._checker_thread: threading.Thread | None = None
 
         # 消费者注册表: consumer_id -> Consumer
         self._consumers: dict[str, Consumer] = {}
@@ -69,6 +78,12 @@ class MQServer:
             logger.info(f"Recovered {len(recovered)} messages from disk")
             for msg in recovered:
                 self.router.restore_message(msg)
+
+        # 启动后台检查线程（超时 ACK、TTL、心跳）
+        self._checker_thread = threading.Thread(
+            target=self._checker_loop, daemon=True
+        )
+        self._checker_thread.start()
 
         logger.info(f"MQ Server listening on {self.host}:{self.port}")
 
@@ -170,9 +185,58 @@ class MQServer:
         """注销消费者"""
         # 从所有 Topic 中移除
         self.topic_mgr.remove_consumer_from_all(consumer.consumer_id)
+        # 从所有消费者组中移除
+        removed_groups = self.group_mgr.remove_consumer_from_all_groups(consumer.consumer_id)
         with self._consumers_lock:
             self._consumers.pop(consumer.consumer_id, None)
         logger.info(f"Consumer {consumer.consumer_id} unregistered")
+        # 重分配未确认消息
+        if removed_groups:
+            self._redeliver_pending_messages(consumer.consumer_id)
+
+    # ================================================================
+    # 后台任务
+    # ================================================================
+
+    def _checker_loop(self) -> None:
+        """后台检查线程：超时 ACK、TTL、心跳"""
+        while self._running:
+            time.sleep(5)  # 每 5 秒检查一次
+            if not self._running:
+                break
+
+            try:
+                # 检查 ACK 超时
+                timed_out = self.ack_mgr.check_timeouts(self.router._messages)
+                for msg_id in timed_out:
+                    msg = self.router.get_message(msg_id)
+                    if msg and msg.status == MessageStatus.PENDING:
+                        # 重投到原始 queue
+                        if self.queue_mgr.queue_exists(msg.target):
+                            self.queue_mgr.enqueue(msg.target, msg.msg_id, msg.body)
+
+                # 检查 TTL
+                self.ack_mgr.check_ttl(self.router._messages)
+
+                # 检查心跳超时
+                offline = self.group_mgr.check_timeouts()
+                for cid in offline:
+                    self._redeliver_pending_messages(cid)
+
+            except Exception:
+                logger.exception("Error in checker loop")
+
+    def _redeliver_pending_messages(self, consumer_id: str) -> None:
+        """将消费者的未确认消息重新入队"""
+        with self.router._msg_lock:
+            for msg_id, msg in self.router._messages.items():
+                if msg.delivered_to == consumer_id and msg.status == MessageStatus.DELIVERED:
+                    msg.status = MessageStatus.PENDING
+                    msg.delivered_to = ""
+                    msg.deliver_time = 0.0
+                    if self.queue_mgr.queue_exists(msg.target):
+                        self.queue_mgr.enqueue(msg.target, msg.msg_id, msg.body)
+                    logger.info(f"Message {msg_id} redelivered from offline consumer '{consumer_id}'")
 
     # ================================================================
     # 命令分发
@@ -345,27 +409,118 @@ class MQServer:
 
     # --- 消息确认 ---
     def _cmd_ack(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 4")
+        msg_id = cmd.args[0]
+        msg = self.router.get_message(msg_id)
+        if msg is None:
+            return err_response("ERR_MESSAGE_NOT_FOUND")
+        try:
+            self.ack_mgr.ack(msg, consumer.consumer_id)
+            return ok_response()
+        except ValueError as e:
+            if "not in DELIVERED state" in str(e):
+                return ok_response()  # 幂等
+            return err_response("ERR_NOT_YOUR_MESSAGE", str(e))
 
     def _cmd_nack(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 4")
+        msg_id = cmd.args[0]
+        msg = self.router.get_message(msg_id)
+        if msg is None:
+            return err_response("ERR_MESSAGE_NOT_FOUND")
+        try:
+            self.ack_mgr.nack(msg, consumer.consumer_id)
+            # 如果 NACK 后变为 PENDING，重新入队
+            if msg.status == MessageStatus.PENDING and self.queue_mgr.queue_exists(msg.target):
+                self.queue_mgr.enqueue(msg.target, msg.msg_id, msg.body)
+            return ok_response()
+        except ValueError:
+            return err_response("ERR_NOT_YOUR_MESSAGE")
 
     def _cmd_ack_batch(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 4")
+        msg_ids = cmd.args
+        failed = []
+        for mid in msg_ids:
+            msg = self.router.get_message(mid)
+            if msg is None:
+                failed.append(mid)
+                continue
+            try:
+                self.ack_mgr.ack(msg, consumer.consumer_id)
+            except ValueError:
+                failed.append(mid)
+        if failed:
+            return err_response("ERR_PARTIAL_ACK", f"Failed: {', '.join(failed)}")
+        return ok_response(f"ACKed {len(msg_ids)} messages")
 
     # --- 消费者组 ---
     def _cmd_create_group(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 4")
+        try:
+            target, group = cmd.args[0], cmd.args[1]
+            self.group_mgr.create_group(target, group)
+            return ok_response(f"Group '{group}' created (target='{target}')")
+        except GroupExistsError:
+            return err_response("ERR_GROUP_EXISTS")
+
+    def _cmd_consume_group(self, cmd: Command, consumer: Consumer) -> str:
+        try:
+            queue, group = cmd.args[0], cmd.args[1]
+
+            # 如果组不存在，自动创建
+            if not self.group_mgr.group_exists(group):
+                if not self.queue_mgr.queue_exists(queue):
+                    return err_response("ERR_QUEUE_NOT_FOUND")
+                self.group_mgr.create_group(queue, group)
+
+            self.group_mgr.join_group(group, consumer.consumer_id)
+            consumer.groups.add(group)
+
+            # Round-Robin：从组中选消费者
+            selected = self.group_mgr.next_consumer(group)
+            if selected != consumer.consumer_id:
+                return null_response()  # 未轮到当前消费者
+
+            msg = self.router.consume_from_queue(queue, consumer.consumer_id)
+            if msg is None:
+                return null_response()
+            return message_response(msg.msg_id, msg.body)
+
+        except QueueNotFoundErr:
+            return err_response("ERR_QUEUE_NOT_FOUND")
 
     def _cmd_delete_group(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 4")
+        try:
+            group = cmd.args[0]
+            self.group_mgr.delete_group(group)
+            return ok_response(f"Group '{group}' deleted")
+        except GroupNotFoundError:
+            return err_response("ERR_GROUP_NOT_FOUND")
+        except GroupHasConsumersError:
+            return err_response("ERR_GROUP_HAS_CONSUMERS")
 
     def _cmd_leave_group(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 4")
+        try:
+            group = cmd.args[0]
+            self.group_mgr.leave_group(group, consumer.consumer_id)
+            consumer.groups.discard(group)
+            return ok_response(f"Left group '{group}'")
+        except GroupNotFoundError:
+            return err_response("ERR_GROUP_NOT_FOUND")
 
     # --- DLQ ---
     def _cmd_replay(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 4")
+        _dlq_marker, msg_id = cmd.args[0], cmd.args[1]
+        msg = self.ack_mgr.replay_from_dlq(msg_id)
+        if msg is None:
+            return err_response("ERR_MESSAGE_NOT_FOUND")
+        self.router.restore_message(msg)
+        if self.queue_mgr.queue_exists(msg.target):
+            self.queue_mgr.enqueue(msg.target, msg.msg_id, msg.body)
+        return ok_response(f"Message {msg_id} replayed")
 
     def _cmd_replay_all(self, cmd: Command, consumer: Consumer) -> str:
-        return err_response("ERR_NOT_IMPLEMENTED", "Coming in Phase 4")
+        _dlq_marker, target = cmd.args[0], cmd.args[1]
+        replayed = self.ack_mgr.replay_all_from_dlq(target)
+        for msg in replayed:
+            self.router.restore_message(msg)
+            if self.queue_mgr.queue_exists(msg.target):
+                self.queue_mgr.enqueue(msg.target, msg.msg_id, msg.body)
+        return ok_response(f"Replayed {len(replayed)} messages to '{target}'")
