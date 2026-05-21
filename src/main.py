@@ -1,10 +1,13 @@
-"""消息队列服务器入口"""
+"""消息队列服务器入口
+
+运行方式: python -m src.main  或  python src/main.py
+"""
 
 import sys
 import os
 
-# 确保 src 目录在 path 中
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 确保项目根目录在 path 中
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.server import MQServer
 
