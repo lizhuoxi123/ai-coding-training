@@ -36,9 +36,9 @@ python src/main.py
 python client.py
 
 # 单命令模式
-python client.py create_topic orders
-python client.py publish orders '{"order_id": 123}'
-python client.py subscribe orders
+python client.py CREATE_TOPIC orders
+python client.py PUBLISH orders '{"order_id": 123}'
+python client.py SUBSCRIBE orders
 ```
 
 ## 命令参考
@@ -46,5 +46,9 @@ python client.py subscribe orders
 
 ## 运行测试
 ```bash
-python -m pytest tests/ -v
+# 协议单元测试（纯函数，无需服务器）
+python tests/test_protocol.py
+
+# 集成测试（自动启动/关闭服务器，TCP 通信）
+python tests/test_integration.py
 ```
