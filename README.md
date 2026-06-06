@@ -52,3 +52,13 @@ python tests/test_protocol.py
 # 集成测试（自动启动/关闭服务器，TCP 通信）
 python tests/test_integration.py
 ```
+
+### 测试结果
+
+**协议单元测试** — 17 passed, 0 failed
+
+![协议测试](docs/test-protocol.png)
+
+**集成测试** — 21 passed, 0 failed
+
+![集成测试](docs/test-integration.png)
